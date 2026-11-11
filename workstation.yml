@@ -1,7 +1,242 @@
 ---
 - name: Base setup for a new workstation
   hosts: workstations
+  vars_files:
+    - secrets.yml
+
+  vars:
+    min_free_gb: 15
+    bg_language_capabilities:
+      - Language.Basic~~~bg-BG~0.0.1.0
+      - Language.OCR~~~bg-BG~0.0.1.0
+      - Language.TextToSpeech~~~bg-BG~0.0.1.0
+    choco_packages:
+      - winrar
+    chrome_url: https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi
+    tightvnc_url: https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi
+    expected_programs:
+      - C:\Program Files\Google\Chrome\Application\chrome.exe
+      - C:\Program Files\WinRAR\WinRAR.exe
+      - C:\Program Files\TightVNC\tvnserver.exe
+
   tasks:
+    # --- 1. Pre-flight checks: stop before touching anything ---------------
+    - name: Make sure this is a Windows workstation, not a server
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == 'Windows'
+          - ansible_facts['os_product_type'] == 'workstation'
+        fail_msg: >-
+          {{ inventory_hostname }} is {{ ansible_facts['os_name'] | default('unknown') }}
+          ({{ ansible_facts['os_product_type'] | default('unknown') }}). Refusing to run.
+        quiet: true
+      tags: [always]
+
+    - name: Make sure the VNC password is set and fits TightVNC (6-8 characters)
+      ansible.builtin.assert:
+        that:
+          - vault_vnc_password is defined
+          - vault_vnc_password | string | length >= 6
+          - vault_vnc_password | string | length <= 8
+        fail_msg: Set vault_vnc_password in secrets.yml (6-8 characters).
+        quiet: true
+      no_log: true
+      tags: [always]
+
+    - name: Read free space on drive C
+      ansible.windows.win_powershell:
+        script: |
+          $Ansible.Changed = $false
+          $Ansible.Result = [math]::Floor((Get-PSDrive C).Free / 1GB)
+      register: disk
+      tags: [always]
+
+    - name: Make sure there is enough free space on drive C
+      ansible.builtin.assert:
+        that:
+          - disk.result | int >= min_free_gb
+        fail_msg: "Only {{ disk.result }} GB free on C:, need at least {{ min_free_gb }} GB."
+        quiet: true
+      tags: [always]
+
+    # --- 2. WinRM ---------------------------------------------------------
+    - name: Start WinRM immediately at boot (not delayed) so reboots are faster
+      ansible.windows.win_service:
+        name: WinRM
+        start_mode: auto
+      tags: [winrm]
+
+    # --- 3. Time, language and region -------------------------------------
     - name: Set time zone to Sofia
       ansible.windows.win_timezone:
         timezone: FLE Standard Time
+      tags: [region]
+
+    - name: Install Bulgarian language capabilities
+      ansible.windows.win_powershell:
+        script: |
+          param([string]$Name)
+          $cap = Get-WindowsCapability -Online -Name $Name
+          if (-not $cap) { throw "Capability '$Name' does not exist on this Windows" }
+
+          if ("$($cap.State)" -in @('Installed', 'InstallPending')) {
+              $Ansible.Changed = $false
+              return
+          }
+
+          Add-WindowsCapability -Online -Name $Name -ErrorAction Stop | Out-Null
+
+          $after = "$((Get-WindowsCapability -Online -Name $Name).State)"
+          if ($after -notin @('Installed', 'InstallPending')) {
+              throw "Capability '$Name' is '$after' after install"
+          }
+        parameters:
+          Name: "{{ item }}"
+      loop: "{{ bg_language_capabilities }}"
+      tags: [region]
+
+    - name: Set keyboard layouts (EN + BG phonetic + BG traditional phonetic)
+      ansible.windows.win_powershell:
+        script: |
+          $wanted  = @('0409:00000409', '0402:00020402', '0402:00040402')
+          $current = @((Get-WinUserLanguageList).InputMethodTips)
+
+          if (-not (Compare-Object -ReferenceObject $wanted -DifferenceObject $current)) {
+              $Ansible.Changed = $false
+              return
+          }
+
+          $list = New-WinUserLanguageList -Language 'en-US'
+          $list[0].InputMethodTips.Clear()
+          $list[0].InputMethodTips.Add('0409:00000409')
+
+          $list.Add('bg-BG')
+          $list[1].InputMethodTips.Clear()
+          $list[1].InputMethodTips.Add('0402:00020402')
+          $list[1].InputMethodTips.Add('0402:00040402')
+
+          Set-WinUserLanguageList -LanguageList $list -Force
+      tags: [region]
+
+    - name: Set region to Bulgaria and copy settings to new users
+      ansible.windows.win_region:
+        location: "35"
+        format: bg-BG
+        unicode_language: bg-BG
+        copy_settings: true
+      register: region_result
+      tags: [region]
+
+    # --- 4. Reboot only if something is waiting for one -------------------
+    - name: Check if Windows is waiting for a reboot
+      ansible.windows.win_powershell:
+        script: |
+          $Ansible.Changed = $false
+          $Ansible.Result = (
+              (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+              (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+          )
+      register: pending_reboot
+      tags: [always]
+
+    - name: Reboot if region or Windows needs it
+      ansible.windows.win_reboot:
+        reboot_timeout: 1200
+      when: (region_result.restart_required | default(false)) or pending_reboot.result
+      tags: [always]
+
+    # --- 5. Software ------------------------------------------------------
+    - name: Install WinRAR
+      chocolatey.chocolatey.win_chocolatey:
+        name: "{{ choco_packages }}"
+        state: present
+      tags: [software]
+
+    - name: Install Google Chrome (enterprise MSI)
+      ansible.windows.win_package:
+        path: "{{ chrome_url }}"
+        creates_path: C:\Program Files\Google\Chrome\Application\chrome.exe
+        state: present
+      tags: [software]
+
+    - name: Install TightVNC server with a password
+      ansible.windows.win_package:
+        path: "{{ tightvnc_url }}"
+        arguments: >-
+          SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1
+          SET_PASSWORD=1 VALUE_OF_PASSWORD={{ vault_vnc_password }}
+        creates_path: C:\Program Files\TightVNC\tvnserver.exe
+        state: present
+      no_log: true
+      tags: [software]
+
+    # --- 6. Windows Update ------------------------------------------------
+    - name: Enable automatic Windows updates (download and install daily at 03:00)
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU
+        name: "{{ item.name }}"
+        data: "{{ item.data }}"
+        type: dword
+      loop:
+        - { name: NoAutoUpdate, data: 0 }
+        - { name: AUOptions, data: 4 }
+        - { name: ScheduledInstallDay, data: 0 }
+        - { name: ScheduledInstallTime, data: 3 }
+        - { name: AllowMUUpdateService, data: 1 }
+      tags: [updates]
+
+    - name: Turn on the Windows Update toggles from Advanced options
+      ansible.windows.win_regedit:
+        path: HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings
+        name: "{{ item }}"
+        data: 1
+        type: dword
+      loop:
+        - AllowMUUpdateService
+        - IsExpedited
+        - RestartNotificationsAllowed2
+      tags: [updates]
+
+    - name: Start a Windows Update scan now and let Windows continue in the background
+      ansible.windows.win_command: UsoClient.exe StartScan
+      changed_when: false
+      tags: [updates]
+
+    # --- 7. Final verification -------------------------------------------
+    - name: Check that the programs are installed
+      ansible.windows.win_stat:
+        path: "{{ item }}"
+      loop: "{{ expected_programs }}"
+      register: programs
+      tags: [verify]
+
+    - name: Fail if a program is missing
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+        fail_msg: "Missing: {{ item.item }}"
+        quiet: true
+      loop: "{{ programs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: [verify]
+
+    - name: Read final keyboard layouts and time zone
+      ansible.windows.win_powershell:
+        script: |
+          $Ansible.Changed = $false
+          $Ansible.Result = @{
+              keyboards = @((Get-WinUserLanguageList).InputMethodTips)
+              timezone  = (Get-TimeZone).Id
+          }
+      register: final_state
+      tags: [verify]
+
+    - name: Fail if keyboards or time zone are wrong
+      ansible.builtin.assert:
+        that:
+          - final_state.result.timezone == 'FLE Standard Time'
+          - final_state.result.keyboards | sort == ['0402:00020402', '0402:00040402', '0409:00000409']
+        fail_msg: "Got time zone {{ final_state.result.timezone }} and keyboards {{ final_state.result.keyboards }}"
+        quiet: true
+      tags: [verify]
