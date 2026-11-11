@@ -1,0 +1,7 @@
+---
+- name: Base setup for a new workstation
+  hosts: workstations
+  tasks:
+    - name: Set time zone to Sofia
+      ansible.windows.win_timezone:
+        timezone: FLE Standard Time
