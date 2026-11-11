@@ -10,13 +10,12 @@
       - Language.Basic~~~bg-BG~0.0.1.0
       - Language.OCR~~~bg-BG~0.0.1.0
       - Language.TextToSpeech~~~bg-BG~0.0.1.0
-    choco_packages:
-      - winrar
+    sevenzip_url: https://github.com/ip7z/7zip/releases/download/26.06/7z2606-x64.msi
     chrome_url: https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi
     tightvnc_url: https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi
     expected_programs:
       - C:\Program Files\Google\Chrome\Application\chrome.exe
-      - C:\Program Files\WinRAR\WinRAR.exe
+      - C:\Program Files\7-Zip\7z.exe
       - C:\Program Files\TightVNC\tvnserver.exe
 
   tasks:
@@ -93,6 +92,9 @@
         parameters:
           Name: "{{ item }}"
       loop: "{{ bg_language_capabilities }}"
+      become: true
+      become_method: ansible.builtin.runas
+      become_user: SYSTEM
       tags: [region]
 
     - name: Set keyboard layouts (EN + BG phonetic + BG traditional phonetic)
@@ -146,9 +148,10 @@
       tags: [always]
 
     # --- 5. Software ------------------------------------------------------
-    - name: Install WinRAR
-      chocolatey.chocolatey.win_chocolatey:
-        name: "{{ choco_packages }}"
+    - name: Install 7-Zip (free for business use, opens RAR too)
+      ansible.windows.win_package:
+        path: "{{ sevenzip_url }}"
+        creates_path: C:\Program Files\7-Zip\7z.exe
         state: present
       tags: [software]
 
